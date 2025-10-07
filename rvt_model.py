@@ -1,6 +1,6 @@
 import marimo
 
-__generated_with = "0.15.0"
+__generated_with = "0.16.5"
 app = marimo.App(width="full")
 
 with app.setup:
@@ -137,11 +137,11 @@ class RvT(nn.Module):
         if use_rotary:
             assert dim_head % 6 == 0, 'Head dimension `dim_head` must be divisible by 6 for 3D RoPE.'
 
-        patch_dim = prod(patch_size)
+        patch_dim = patch_size*patch_size
 
         self.patch_size = patch_size
         self.to_patch_embedding = nn.Sequential(
-            Rearrange('b n pd pc pr -> b n (pd pc pr)'),
+            Rearrange('b n h w -> b n (h w)'),
             nn.Linear(patch_dim, dim),
         )
 

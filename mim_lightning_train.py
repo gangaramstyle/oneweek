@@ -54,7 +54,7 @@ class RadiographyEncoder(L.LightningModule):
             super().__init__()
             self.pos_emb = PosEmbedding3D(dim, max_freq = pos_max_freq)
             self.mim = CrossAttender(dim = dim, depth = depth, layer_dropout=layer_dropout)
-            self.to_pixels = nn.Linear(dim, np.prod(patch_size))
+            self.to_pixels = nn.Linear(dim, patch_size*patch_size)
             self.patch_size = patch_size
 
         def forward(self, coords, context):
@@ -65,7 +65,7 @@ class RadiographyEncoder(L.LightningModule):
 
             unmasked = self.mim(pos, context=context)
             unmasked = self.to_pixels(unmasked)
-            unmasked = unmasked.view(unmasked.size(0), unmasked.size(1), *self.patch_size)
+            unmasked = unmasked.view(unmasked.size(0), unmasked.size(1), self.patch_size, self.patch_size)
             return unmasked
 
     @staticmethod
@@ -161,7 +161,6 @@ class RadiographyEncoder(L.LightningModule):
         learning_rate,
         # dataset hyperparameters
         patch_size,
-        patch_jitter,
         # objectives
         pos_objective_mode,
         window_objective,
@@ -426,7 +425,7 @@ class RadiographyEncoder(L.LightningModule):
 def _(sample_1_aux, sample_2_aux):
     class PrismOrderingDataset(IterableDataset):
 
-        def __init__(self, metadata, include_nifti, patch_shape, position_space, n_patches, n_aux_patches, n_sampled_from_same_study, scratch_dir):
+        def __init__(self, metadata, patch_shape, position_space, n_patches, n_sampled_from_same_study, scratch_dir):
             super().__init__()
             self.metadata = pd.read_parquet(metadata).dropna()
             self.patch_shape = patch_shape
@@ -443,8 +442,8 @@ def _(sample_1_aux, sample_2_aux):
             wc1, ww1 = scan.get_random_wc_ww_for_scan()
             wc2, ww2 = scan.get_random_wc_ww_for_scan()
 
-            sample_1_data = scan.train_sample(n_patches=n_patches, patch_shape=(16, 16, 1), wc=wc1, ww=ww1)
-            sample_2_data = scan.train_sample(n_patches=n_patches, patch_shape=(16, 16, 1), wc=wc2, ww=ww2)
+            sample_1_data = scan.train_sample(n_patches=n_patches, wc=wc1, ww=ww1)
+            sample_2_data = scan.train_sample(n_patches=n_patches, wc=wc2, ww=ww2)
 
 
             patches_1 = sample_1_data['normalized_patches']
@@ -461,7 +460,6 @@ def _(sample_1_aux, sample_2_aux):
             window_label = np.array([wc2 - wc1, ww2 - ww1])
 
             label = np.concatenate((pos_label, rotation_label, window_label))
-
 
             tensors = [
                 patches_1, patches_2, patch_coords_1, patch_coords_2,
@@ -516,13 +514,15 @@ def _(sample_1_aux, sample_2_aux):
                         path_to_scan=path_to_load,
                         median=median,
                         stdev=stdev,
+                        base_patch_size=self.patch_shape
+
                     )
 
                     print(f"[Worker {worker_id}] Generating pairs for {path_to_load}...")
                     for _ in range(self.n_sampled_from_same_study):
                         training_pair = self.generate_training_pair(
                             scan,
-                            n_patches=self.n_patches,
+                            n_patches=self.n_patches,                        
                         )
 
                         yield training_pair
@@ -619,32 +619,7 @@ def _(PrismOrderingDataset):
         # We will still use a local checkpoint directory for new checkpoints
         checkpoint_dir = f'../checkpoints/{run.id}'
 
-        # Pull the final config from wandb.
-        config_dict = {
-            "batch_size": 256,
-            "encoder_depth": 16,
-            "encoder_dim": 432,
-            "encoder_heads": 12,
-            "include_nifti": True,
-            "learning_rate": 0.00008232689121870076,
-            "max_freq": 60,
-            "mim_objective": True,
-            "mlp_dim": 768,
-            "n_aux_patches": 0,
-            "n_registers": 8,
-            "num_repeated_study_samples": 64,
-            "patch_jitter": 1,
-            "patch_size": (16, 16, 1),
-            "pos_max_freq": 60,
-            "pos_objective_mode": "classification",
-            "position_space": "patient",
-            "scan_contrastive_objective": False,
-            "use_absolute": True,
-            "use_rotary": True,
-            "window_objective": False,
-        }
-
-        cfg = SimpleNamespace(**config_dict)
+        cfg = run.config
 
         # --- 2. Handle Resuming from Wandb Artifacts ---
         ckpt_path = None
@@ -684,13 +659,12 @@ def _(PrismOrderingDataset):
             encoder_heads=cfg.encoder_heads,
             mlp_dim=cfg.mlp_dim,
             n_registers=cfg.n_registers,
-            pos_max_freq=cfg.max_freq,
+            pos_max_freq=cfg.pos_max_freq,
             use_rotary=cfg.use_rotary,
             use_absolute=cfg.use_absolute,
             batch_size=cfg.batch_size,
             learning_rate=cfg.learning_rate,
             patch_size=cfg.patch_size,
-            patch_jitter=1.0,
             pos_objective_mode=cfg.pos_objective_mode,
             window_objective=cfg.window_objective,
             scan_contrastive_objective=cfg.scan_contrastive_objective,
@@ -702,7 +676,7 @@ def _(PrismOrderingDataset):
         NUM_WORKERS = int(get_allocated_cpus())-2
         METADATA_PATH = os.environ.get(
             'METADATA_PATH', 
-            '/default/path/for/local/testing.parquet'
+            '/test/home/gangarav/rsna25/aneurysm_labels_with_nifti_coords.parquet'
         )
         # METADATA_PATH = '/cbica/home/gangarav/rsna25/aneurysm_labels_with_nifti_coords.parquet'
 
@@ -718,12 +692,10 @@ def _(PrismOrderingDataset):
         os.makedirs(scratch_dir, exist_ok=True)
 
         dataset = PrismOrderingDataset(
-            include_nifti=cfg.include_nifti,
             metadata=METADATA_PATH,
             patch_shape=cfg.patch_size,
             n_patches=N_PATCHES,
             position_space=cfg.position_space,
-            n_aux_patches=cfg.n_aux_patches,
             scratch_dir=scratch_dir,
             n_sampled_from_same_study=cfg.num_repeated_study_samples
         )
