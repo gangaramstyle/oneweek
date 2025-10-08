@@ -67,7 +67,7 @@ def _(base_patch_shape, metadata_df, n_patches_input, run_button, table):
             .replace(".zarr", ".nii")
         )
 
-    
+
         scan = nifti_scan(path_to_scan=nifti_name, median=metadata_row["median"].values[0], stdev=metadata_row["stdev"].values[0], base_patch_size=base_patch_size)
         patch_shape = scan.patch_shape
     return metadata_row, n_patches, nifti_name, patch_shape, scan
@@ -184,7 +184,7 @@ def _(
     relative_rotated_centers = scan.calculate_rotated_relative_positions(
         patch_centers_patient=patch_centers_patient,
         main_center_patient=main_center_patient,
-        forward_rotation_matrix=params["forward_rotation_matrix"]
+        forward_rotation_matrix=params["inverse_rotation_matrix"]
     )
     return (
         final_patches,
@@ -237,6 +237,29 @@ def _(final_patches, scan_max, scan_min, sld):
     patch_display[0, 0] = scan_max
     patch_display[-1, -1] = scan_min
     mo.image(src=patch_display, width=128)
+    return
+
+
+@app.cell
+def _(
+    main_center_patient,
+    patch_centers_patient,
+    relative_rotated_centers,
+    sld,
+):
+    (relative_rotated_centers - (patch_centers_patient - main_center_patient))[sld.value]
+    return
+
+
+@app.cell
+def _(main_center_patient, patch_centers_patient, sld):
+    (patch_centers_patient - main_center_patient)[sld.value]
+    return
+
+
+@app.cell
+def _(relative_rotated_centers, sld):
+    relative_rotated_centers[sld.value]
     return
 
 
@@ -351,7 +374,7 @@ class nifti_scan():
         results['normalized_patches'] = normalized_patches
 
         return results
-        
+
     def get_outlier_axis_patch_shape(
         self, base_patch_size: int, similarity_threshold: float = 1.5
     ) -> Tuple[int, int, int]:
@@ -389,7 +412,7 @@ class nifti_scan():
         patch_shape[outlier_axis_idx] = 1
 
         return tuple(patch_shape)
-    
+
 
     def get_random_wc_ww_for_scan(self):
         return random.uniform(self.med-self.std, self.med+self.std), random.uniform(2*self.std, 6*self.std)
@@ -608,7 +631,7 @@ class nifti_scan():
         relative_rotated_centers = self.calculate_rotated_relative_positions(
             patch_centers_patient=patch_centers_patient,
             main_center_patient=main_center_patient,
-            forward_rotation_matrix=params["forward_rotation_matrix"]
+            forward_rotation_matrix=params["inverse_rotation_matrix"]
         )
 
         # --- Step 6: Return all results ---
