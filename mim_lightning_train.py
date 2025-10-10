@@ -483,8 +483,7 @@ def _(sample_1_aux, sample_2_aux):
                 worker_id = worker_info.id
                 worker_metadata = self.metadata.iloc[worker_id::worker_info.num_workers]
                 worker_metadata = worker_metadata[
-                    (worker_metadata["raw_path"].notnull()) &
-                    (worker_metadata["original_format"] == 'nifti')
+                    (worker_metadata["raw_path"].notnull())
                 ]
                 # Seed each worker differently to ensure random shuffling is unique
                 seed = (torch.initial_seed() + worker_id) % (2**32)
@@ -497,7 +496,7 @@ def _(sample_1_aux, sample_2_aux):
 
                 sample = worker_metadata.sample(n=1).iloc[0]
 
-                path_to_load = sample["raw_path"]
+                path_to_load = sample["raw_path"].replace('series', 'nifti') + ".nii"
 
                 median = sample["median"]
                 stdev = sample["stdev"]

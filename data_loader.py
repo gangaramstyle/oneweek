@@ -352,10 +352,10 @@ class nifti_scan():
         results['subset_center'] = subset_center
 
         if rotation_degrees is None:
-            rotation_degrees = (random.randint(-30, 30), random.randint(-30, 30), random.randint(-30, 30))
+            rotation_degrees = (random.randint(-20, 20), random.randint(-20, 20), random.randint(-20, 20))
         results['rotation_degrees'] = rotation_degrees
 
-        patches, prism_center_pt, patch_centers_pt, relative_rotated_patch_centers_pt = self.sample_and_rotate_patches(
+        patches, prism_center_pt, patch_centers_vox, patch_centers_pt, relative_rotated_patch_centers_pt = self.sample_and_rotate_patches(
             n_patches,
             subset_center,
             sampling_radius_mm,
@@ -364,6 +364,8 @@ class nifti_scan():
         )
 
         results['prism_center_pt'] = prism_center_pt
+        results['patch_centers_vox'] = patch_centers_vox 
+        results['patch_centers_pt'] = patch_centers_pt   
         results['relative_patch_centers_pt'] = relative_rotated_patch_centers_pt
         results['raw_patches'] = patches
 
@@ -635,7 +637,7 @@ class nifti_scan():
         )
 
         # --- Step 6: Return all results ---
-        return final_patches, main_center_patient, patch_centers_patient, relative_rotated_centers
+        return final_patches, main_center_patient, patch_centers_vox, patch_centers_patient, relative_rotated_centers
 
 
 @app.cell

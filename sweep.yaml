@@ -10,12 +10,12 @@ parameters:
     min: 3.0e-5
     max: 1.0e-3
   n_registers:
-    values: [8, 12]
+    values: [8, 12, 32]
   pos_max_freq:
-    values: [14, 30, 60]
+    values: [1, 5, 14]
 
   encoder_depth:
-    value: 16
+    values: [16, 24, 32]
   encoder_heads:
     value: 12
   encoder_dim:
@@ -35,7 +35,7 @@ parameters:
     value: true
 
   num_repeated_study_samples:
-    values: [32, 128, 256]
+    values: [8, 32]
   pos_objective_mode:
     value: 'classification'
   position_space:
