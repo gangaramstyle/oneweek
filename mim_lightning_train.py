@@ -35,12 +35,15 @@ with app.setup:
     from sklearn.svm import SVC
     import matplotlib
     matplotlib.use('Agg') # <-- This is correct, keep it.
-
+    import boto3
+    from botocore.client import Config
+    from botocore.exceptions import ClientError
     from sklearn.metrics import confusion_matrix, ConfusionMatrixDisplay
     import matplotlib.pyplot as plt
     import imageio
     import io
-
+    import nibabel as nib
+    from pathlib import Path
     from types import SimpleNamespace
 
 
@@ -326,174 +329,211 @@ class RadiographyEncoder(L.LightningModule):
         return optimizer
 
 
-@app.cell
-def _(Path, nib, requests):
-    class PrismOrderingDataset(IterableDataset):
-        def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study,
-                     cache_base_dir: str, cache_size: int = 20, max_uses_per_file: int = 50):
-            super().__init__()
-            self.metadata = pd.read_csv(metadata)
-            self.patch_shape = patch_shape
-            self.n_patches = n_patches
-            self.n_sampled_from_same_study = n_sampled_from_same_study
+@app.class_definition
+class PrismOrderingDataset(IterableDataset):
+    def __init__(self, metadata, patch_shape, n_patches, n_sampled_from_same_study,
+                 cache_base_dir: str, r2_bucket_name: str, r2_account_id: str,
+                 r2_access_key: str, r2_secret_key: str,
+                 cache_size: int = 20, max_uses_per_file: int = 50):
+        super().__init__()
+        self.metadata = pd.read_csv(metadata)
+        self.patch_shape = patch_shape
+        self.n_patches = n_patches
+        self.n_sampled_from_same_study = n_sampled_from_same_study
 
-            self.cache_base_dir = Path(cache_base_dir)
-            self.cache_size = cache_size
-            self.max_uses_per_file = max_uses_per_file
-            self.r2_base_url = ""
+        # Cache settings
+        self.cache_base_dir = Path(cache_base_dir)
+        self.cache_size = cache_size
+        self.max_uses_per_file = max_uses_per_file
 
-            # Worker-specific attributes, initialized in __iter__
-            self.worker_cache_dir = None
-            self.cache_state = {}  # Tracks {remote_path: {"local_path": ..., "uses": ...}}
+        # R2 settings for boto3
+        self.r2_bucket_name = r2_bucket_name
+        self.r2_account_id = r2_account_id
+        self.r2_access_key = r2_access_key
+        self.r2_secret_key =r2_secret_key
 
-        def _download_file(self, remote_path, local_path):
-            """Downloads a single file from R2 to a local path."""
-            file_url = self.r2_base_url + remote_path
-            try:
-                response = requests.get(file_url, timeout=60)
-                response.raise_for_status()  # Will raise an HTTPError for bad responses
-                with open(local_path, 'wb') as f:
-                    f.write(response.content)
-                return True
-            except requests.exceptions.RequestException as e:
-                print(f"Failed to download {remote_path}: {e}")
-                return False
+        # Worker-specific attributes, initialized in __iter__
+        self.worker_id = None
+        self.worker_cache_dir = None
+        self.cache_state = {}  # Tracks {remote_path: {"local_path": ..., "uses": ...}}
+        self.s3_client = None  # S3 client will be created per worker
 
-        def _compute_robust_stats(self, data_array):
-            """Computes median and stdev after filtering out extreme values."""
-            stdev = np.std(data_array)
-            values, counts = np.unique(data_array, return_counts=True)
-        
-            # Determine number of top values to filter based on stdev
-            num_top_to_remove = int(np.maximum(stdev // 10, 1))
-            if num_top_to_remove >= len(values):
-                num_top_to_remove = len(values) - 1 # Avoid removing all unique values
+    def _initialize_s3_client(self):
+        """Initializes the S3 client for the worker."""
+        try:
+            endpoint_url = f"https://{self.r2_account_id}.r2.cloudflarestorage.com"
+            # Use an unsigned configuration for public buckets, no credentials needed.
+            self.s3_client = boto3.client(
+                's3',
+                endpoint_url=endpoint_url,
+                aws_access_key_id=self.r2_access_key,
+                aws_secret_access_key=self.r2_secret_key,
+                region_name='auto' # or your specific region
+            )
+        except Exception as e:
+            print(f"[Worker {self.worker_id}] Failed to initialize S3 client: {e}")
+            self.s3_client = None
 
-            top_indices = np.argsort(counts)[-num_top_to_remove:]
-            mask = ~np.isin(data_array, values[top_indices])
-        
-            filtered_img = data_array[mask]
-            if filtered_img.size == 0: # Fallback if mask removes everything
-                return np.median(data_array), np.std(data_array)
-            
-            median = np.median(filtered_img)
-            stdev = np.std(filtered_img)
-            return median, stdev
 
-        def _populate_initial_cache(self, worker_metadata):
-            """Fills the cache for the first time."""
-            print(f"[Worker {self.worker_id}] Populating initial cache of size {self.cache_size}...")
-            while len(self.cache_state) < self.cache_size:
-                # Sample a new file that isn't already in the cache keys
-                sample = worker_metadata[~worker_metadata['file_path'].isin(self.cache_state.keys())].sample(n=1).iloc[0]
-                remote_path = sample["file_path"]
-                local_filename = remote_path.replace("/", "_") # Make filename safe
-                local_path = self.worker_cache_dir / local_filename
-            
-                if self._download_file(remote_path, local_path):
-                    self.cache_state[remote_path] = {"local_path": local_path, "uses": 0}
-            print(f"[Worker {self.worker_id}] Cache populated.")
-    
-        def _replace_cached_file(self, remote_path_to_replace, worker_metadata):
-            """Deletes an old file and downloads a new one to replace it."""
-            # 1. Remove old file
-            file_info = self.cache_state.pop(remote_path_to_replace)
+    def _download_file(self, remote_path, local_path):
+        """Downloads a single file from R2 to a local path using boto3."""
+        if not self.s3_client:
+            print(f"[Worker {self.worker_id}] S3 client not initialized. Cannot download.")
+            return False
+        try:
+            self.s3_client.download_file(
+                self.r2_bucket_name,
+                remote_path,
+                str(local_path) # boto3 expects a string path
+            )
+            return True
+        except ClientError as e:
+            error_code = e.response.get("Error", {}).get("Code")
+            if error_code == '404':
+                print(f"[Worker {self.worker_id}] Error: s3://{self.r2_bucket_name}/{remote_path} not found.")
+            else:
+                print(f"[Worker {self.worker_id}] S3 ClientError downloading {remote_path}: {e}")
+            return False
+        except Exception as e:
+            print(f"[Worker {self.worker_id}] Unexpected error downloading {remote_path}: {e}")
+            return False
+
+    def _compute_robust_stats(self, data_array):
+        """Computes median and stdev after filtering out extreme values."""
+        stdev = np.std(data_array)
+        values, counts = np.unique(data_array, return_counts=True)
+
+        num_top_to_remove = int(np.maximum(stdev // 10, 1))
+        if num_top_to_remove >= len(values):
+            num_top_to_remove = len(values) - 1
+
+        top_indices = np.argsort(counts)[-num_top_to_remove:]
+        mask = ~np.isin(data_array, values[top_indices])
+
+        filtered_img = data_array[mask]
+        if filtered_img.size == 0:
+            return np.median(data_array), np.std(data_array)
+
+        median = np.median(filtered_img)
+        stdev = np.std(filtered_img)
+        return median, stdev
+
+    def _populate_initial_cache(self, worker_metadata):
+        """Fills the cache for the first time."""
+        print(f"[Worker {self.worker_id}] Populating initial cache of size {self.cache_size}...")
+        while len(self.cache_state) < self.cache_size:
+            sample = worker_metadata[~worker_metadata['file_path'].isin(self.cache_state.keys())].sample(n=1).iloc[0]
+            remote_path = sample["file_path"]
+            local_filename = remote_path.replace("/", "_")
+            local_path = self.worker_cache_dir / local_filename
+
+            if self._download_file(remote_path, local_path):
+                self.cache_state[remote_path] = {"local_path": local_path, "uses": 0}
+        print(f"[Worker {self.worker_id}] Cache populated.")
+
+    def _replace_cached_file(self, remote_path_to_replace, worker_metadata):
+        """Deletes an old file and downloads a new one to replace it."""
+        # 1. Remove old file
+        file_info = self.cache_state.pop(remote_path_to_replace, None)
+        if file_info:
             try:
                 os.remove(file_info["local_path"])
             except OSError as e:
                 print(f"[Worker {self.worker_id}] Error removing {file_info['local_path']}: {e}")
 
-            # 2. Add a new file
-            new_file_added = False
-            while not new_file_added:
-                sample = worker_metadata[~worker_metadata['file_path'].isin(self.cache_state.keys())].sample(n=1).iloc[0]
-                new_remote_path = sample["file_path"]
-                local_filename = new_remote_path.replace("/", "_")
-                new_local_path = self.worker_cache_dir / local_filename
+        # 2. Add a new file
+        new_file_added = False
+        while not new_file_added:
+            sample = worker_metadata[~worker_metadata['file_path'].isin(self.cache_state.keys())].sample(n=1).iloc[0]
+            new_remote_path = sample["file_path"]
+            local_filename = new_remote_path.replace("/", "_")
+            new_local_path = self.worker_cache_dir / local_filename
 
-                if self._download_file(new_remote_path, new_local_path):
-                    self.cache_state[new_remote_path] = {"local_path": new_local_path, "uses": 0}
-                    new_file_added = True
-                    print(f"[Worker {self.worker_id}] Rotated cache: Replaced {remote_path_to_replace} with {new_remote_path}")
+            if self._download_file(new_remote_path, new_local_path):
+                self.cache_state[new_remote_path] = {"local_path": new_local_path, "uses": 0}
+                new_file_added = True
+                print(f"[Worker {self.worker_id}] Rotated cache: Replaced {remote_path_to_replace} with {new_remote_path}")
 
-        def __iter__(self):
-            worker_info = torch.utils.data.get_worker_info()
-            self.worker_id = worker_info.id if worker_info else 0
-        
-            if worker_info is None:
-                worker_metadata = self.metadata
-            else:
-                worker_metadata = self.metadata.iloc[self.worker_id::worker_info.num_workers]
-                seed = (torch.initial_seed() + self.worker_id) % (2**32)
-                np.random.seed(seed)
-                random.seed(seed)
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        self.worker_id = worker_info.id if worker_info else 0
 
-            # --- Setup Worker Cache ---
-            self.worker_cache_dir = self.cache_base_dir / f"worker_{self.worker_id}"
-            shutil.rmtree(self.worker_cache_dir, ignore_errors=True) # Clean up from previous runs
-            self.worker_cache_dir.mkdir(parents=True, exist_ok=True)
-            self.cache_state = {}
-            self._populate_initial_cache(worker_metadata)
+        if worker_info is None:
+            worker_metadata = self.metadata
+        else:
+            worker_metadata = self.metadata.iloc[self.worker_id::worker_info.num_workers]
+            seed = (torch.initial_seed() + self.worker_id) % (2**32)
+            np.random.seed(seed)
+            random.seed(seed)
 
-            while True:
-                # 1. Select a random file FROM THE CACHE
-                remote_path = random.choice(list(self.cache_state.keys()))
-                file_info = self.cache_state[remote_path]
-                local_path = file_info["local_path"]
-            
-                try:
-                    # 2. Load from local disk and compute stats
-                    nifti_image = nib.as_closest_canonical(nib.load(local_path))
-                    image_data = nifti_image.get_fdata()
-                    median, stdev = self._compute_robust_stats(image_data)
+        # --- Boto3 S3 Client Initialization (per-worker) ---
+        self._initialize_s3_client()
 
-                    # 3. Instantiate the scan loader
-                    scan = nifti_scan(
-                        path_to_scan=str(local_path), # Use local path
-                        nifti_obj=nifti_image, # Pass loaded object to avoid re-reading
-                        median=median,
-                        stdev=stdev,
-                        base_patch_size=self.patch_shape
-                    )
-                
-                    # 4. Generate training pairs from this scan
-                    for _ in range(self.n_sampled_from_same_study):
-                        yield self.generate_training_pair(scan, n_patches=self.n_patches)
-                
-                    # 5. Update usage and check for rotation
-                    file_info["uses"] += 1
-                    if file_info["uses"] >= self.max_uses_per_file:
-                        self._replace_cached_file(remote_path, worker_metadata)
+        # --- Setup Worker Cache ---
+        self.worker_cache_dir = self.cache_base_dir / f"worker_{self.worker_id}"
+        shutil.rmtree(self.worker_cache_dir, ignore_errors=True)
+        self.worker_cache_dir.mkdir(parents=True, exist_ok=True)
+        self.cache_state = {}
+        self._populate_initial_cache(worker_metadata)
 
-                except Exception as e:
-                    print(f"[Worker {self.worker_id}] CRITICAL: Error processing {remote_path}, replacing it. Error: {e}")
+        while True:
+            if not self.cache_state:
+                print(f"[Worker {self.worker_id}] Cache is empty, cannot proceed.")
+                break
+
+            remote_path = random.choice(list(self.cache_state.keys()))
+            file_info = self.cache_state[remote_path]
+            local_path = file_info["local_path"]
+
+            try:
+                nifti_image = nib.as_closest_canonical(nib.load(local_path))
+                image_data = nifti_image.get_fdata()
+                median, stdev = self._compute_robust_stats(image_data)
+
+                # Assuming nifti_scan is defined
+                scan = nifti_scan(
+                    path_to_scan=str(local_path),
+                    median=median,
+                    stdev=stdev,
+                    base_patch_size=self.patch_shape
+                )
+
+                for _ in range(self.n_sampled_from_same_study):
+                    yield self.generate_training_pair(scan, n_patches=self.n_patches)
+
+                file_info["uses"] += 1
+                if file_info["uses"] >= self.max_uses_per_file:
                     self._replace_cached_file(remote_path, worker_metadata)
-                    continue
 
-        # `generate_training_pair` method remains unchanged from your original code
-        def generate_training_pair(self, scan, n_patches: int, debug: bool = False) -> tuple:
-            # ... (Your existing implementation here)
-            wc1, ww1 = scan.get_random_wc_ww_for_scan()
-            wc2, ww2 = scan.get_random_wc_ww_for_scan()
-            sample_1_data = scan.train_sample(n_patches=n_patches, wc=wc1, ww=ww1)
-            sample_2_data = scan.train_sample(n_patches=n_patches, wc=wc2, ww=ww2)
-            patches_1 = sample_1_data['normalized_patches']
-            patches_2 = sample_2_data['normalized_patches']
-            patch_coords_1 = sample_1_data['relative_patch_centers_pt']
-            patch_coords_2 = sample_2_data['relative_patch_centers_pt']
-            pos_label = (sample_2_data['prism_center_pt'] - sample_1_data['prism_center_pt'])
-            rotation_label = (np.array(sample_2_data['rotation_degrees']) - np.array(sample_1_data['rotation_degrees']))
-            window_label = np.array([wc2 - wc1, ww2 - ww1])
-            label = np.concatenate((pos_label, rotation_label, window_label))
-            tensors = [patches_1, patches_2, patch_coords_1, patch_coords_2, label]
-            if debug:
-                return tuple(torch.from_numpy(arr).to(torch.float32) for arr in tensors), sample_1_data, sample_2_data
-            return tuple(torch.from_numpy(arr).to(torch.float32) for arr in tensors)
-    return (PrismOrderingDataset,)
+            except Exception as e:
+                print(f"[Worker {self.worker_id}] CRITICAL: Error processing {remote_path}, replacing it. Error: {e}")
+                self._replace_cached_file(remote_path, worker_metadata)
+                continue
+
+    # `generate_training_pair` method remains unchanged from your original code
+    def generate_training_pair(self, scan, n_patches: int, debug: bool = False) -> tuple:
+        # This implementation is a placeholder based on your original code
+        # You would use your actual `scan.get_random_wc_ww_for_scan` and `scan.train_sample` here
+        wc1, ww1 = scan.get_random_wc_ww_for_scan()
+        wc2, ww2 = scan.get_random_wc_ww_for_scan()
+        sample_1_data = scan.train_sample(n_patches=n_patches, wc=wc1, ww=ww1)
+        sample_2_data = scan.train_sample(n_patches=n_patches, wc=wc2, ww=ww2)
+        patches_1 = sample_1_data['normalized_patches']
+        patches_2 = sample_2_data['normalized_patches']
+        patch_coords_1 = sample_1_data['relative_patch_centers_pt']
+        patch_coords_2 = sample_2_data['relative_patch_centers_pt']
+        pos_label = (sample_2_data['prism_center_pt'] - sample_1_data['prism_center_pt'])
+        rotation_label = (np.array(sample_2_data['rotation_degrees']) - np.array(sample_1_data['rotation_degrees']))
+        window_label = np.array([wc2 - wc1, ww2 - ww1])
+        label = np.concatenate((pos_label, rotation_label, window_label))
+        tensors = [patches_1, patches_2, patch_coords_1, patch_coords_2, label]
+        if debug:
+            return tuple(torch.from_numpy(arr).to(torch.float32) for arr in tensors), sample_1_data, sample_2_data
+        return tuple(torch.from_numpy(arr).to(torch.float32) for arr in tensors)
 
 
 @app.cell
-def _(PrismOrderingDataset):
+def _():
     def get_allocated_cpus():
         return int(os.environ.get("SLURM_CPUS_PER_GPU", 8))
 
@@ -514,10 +554,10 @@ def _(PrismOrderingDataset):
         run = wandb.init(resume="allow")
         print(f"Run config:\n{run.config}")
         print("="*20)
-    
+
         checkpoint_dir = f'../checkpoints/{run.id}'
         cfg = run.config
-    
+
         # --- Resuming logic remains the same ---
         ckpt_path = None
         if run.resumed:
@@ -550,11 +590,18 @@ def _(PrismOrderingDataset):
         METADATA_PATH = "300_labeled.csv"
         N_PATCHES = 64
         NUM_WORKERS = int(get_allocated_cpus()) - 2
-    
-        # This directory will now serve as the root for worker-specific caches.
-        CACHE_DIR = "./temp_cache"
+
+        CACHE_DIR = tempfile.gettempdir()
+
+        if not os.path.isdir(CACHE_DIR) or not os.access(CACHE_DIR, os.W_OK):
+            raise IOError(
+                f"The determined temporary directory '{CACHE_DIR}' "
+                "is not a writable directory. Check system configuration and permissions."
+            )
+
+        CACHE_DIR = os.path.join(CACHE_DIR, "scans")
         os.makedirs(CACHE_DIR, exist_ok=True)
-    
+
         # --- UPDATED DATASET INSTANTIATION ---
         dataset = PrismOrderingDataset(
             metadata=METADATA_PATH,
@@ -564,7 +611,8 @@ def _(PrismOrderingDataset):
             # New cache arguments
             cache_base_dir=CACHE_DIR,
             cache_size=20,
-            max_uses_per_file=50
+            max_uses_per_file=50,
+            ###
         )
 
         dataloader = DataLoader(
@@ -595,7 +643,7 @@ def _(PrismOrderingDataset):
             val_check_interval=5000,
             num_sanity_val_steps=0,
             strategy="auto",
-            devices=1,
+            devices=-1,
             accelerator="gpu"
         )
 
