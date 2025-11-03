@@ -422,16 +422,17 @@ class RadiographyEncoder(L.LightningModule):
 
 
 @app.cell
-def _(sample_1_aux, sample_2_aux):
+def _(nib, sample_1_aux, sample_2_aux):
     class PrismOrderingDataset(IterableDataset):
 
         def __init__(self, metadata, patch_shape, position_space, n_patches, n_sampled_from_same_study, scratch_dir):
             super().__init__()
-            self.metadata = pd.read_parquet(metadata).dropna()
+            self.metadata = pd.read_csv(metadata)
             self.patch_shape = patch_shape
             self.n_patches = n_patches
             self.n_sampled_from_same_study = n_sampled_from_same_study
             self.position_space=position_space
+            self.filter_prefix = "1.2."
 
 
         def generate_training_pair(self, scan, n_patches: int, position_space = "patient", n_aux_patches: int = 0, debug: bool = False) -> tuple:
@@ -470,6 +471,26 @@ def _(sample_1_aux, sample_2_aux):
 
             return tuple(torch.from_numpy(arr).to(torch.float32) for arr in tensors)
 
+        def _compute_robust_stats(self, data_array):
+            """Computes median and stdev after filtering out extreme values."""
+            stdev = np.std(data_array)
+            values, counts = np.unique(data_array, return_counts=True)
+
+            num_top_to_remove = int(np.maximum(stdev // 10, 1))
+            if num_top_to_remove >= len(values):
+                num_top_to_remove = len(values) - 1
+
+            top_indices = np.argsort(counts)[-num_top_to_remove:]
+            mask = ~np.isin(data_array, values[top_indices])
+
+            filtered_img = data_array[mask]
+            if filtered_img.size == 0:
+                return np.median(data_array), np.std(data_array)
+
+            median = np.median(filtered_img)
+            stdev = np.std(filtered_img)
+            return median, stdev
+
         def __iter__(self):
             worker_info = torch.utils.data.get_worker_info()
             worker_id = worker_info.id if worker_info else 0 # Get worker ID
@@ -483,7 +504,7 @@ def _(sample_1_aux, sample_2_aux):
                 worker_id = worker_info.id
                 worker_metadata = self.metadata.iloc[worker_id::worker_info.num_workers]
                 worker_metadata = worker_metadata[
-                    (worker_metadata["raw_path"].notnull())
+                    (worker_metadata["file_path"].notnull())
                 ]
                 # Seed each worker differently to ensure random shuffling is unique
                 seed = (torch.initial_seed() + worker_id) % (2**32)
@@ -492,26 +513,42 @@ def _(sample_1_aux, sample_2_aux):
 
             print(f"[Worker {worker_id}] assigned {len(worker_metadata)} scans.")
 
+            filtered_metadata = pd.DataFrame()
+            if self.filter_prefix:
+                mask = worker_metadata['file_path'].str.startswith(self.filter_prefix, na=False)
+                filtered_metadata = worker_metadata[mask]
+                if filtered_metadata.empty:
+                    print(f"[Worker {worker_id}] WARNING: filter_prefix '{self.filter_prefix}' yielded 0 scans.")
+                else:
+                    print(f"[Worker {worker_id}] Found {len(filtered_metadata)} scans with prefix '{self.filter_prefix}'.")
+            use_filtered_set = not filtered_metadata.empty
+
             while True:
 
-                sample = worker_metadata.sample(n=1).iloc[0]
+                if use_filtered_set and random.random() < 0.5:
+                    sample = filtered_metadata.sample(n=1).iloc[0]
+                else:
+                    sample = worker_metadata.sample(n=1).iloc[0]
 
-                path_to_load = sample["raw_path"].replace('series', 'nifti') + ".nii"
-
-                median = sample["median"]
-                stdev = sample["stdev"]
+                path_to_load = "/cbica/home/gangarav/oneweek_data/" + sample["file_path"]
 
                 # 2. Instantiate the scan loader with all necessary info
                 try:
                     print(path_to_load)
 
+                    nifti_image = nib.as_closest_canonical(nib.load(path_to_load))
+                    image_data = nifti_image.get_fdata()
+                    median, stdev = self._compute_robust_stats(image_data)
+
+                    # Assuming nifti_scan is defined
                     scan = nifti_scan(
-                        path_to_scan=path_to_load,
+                        path_to_scan=str(path_to_load),
                         median=median,
                         stdev=stdev,
                         base_patch_size=self.patch_shape
-
                     )
+
+                    print(path_to_load)
 
                     print(f"[Worker {worker_id}] Generating pairs for {path_to_load}...")
                     for _ in range(self.n_sampled_from_same_study):
@@ -522,7 +559,7 @@ def _(sample_1_aux, sample_2_aux):
 
                         yield training_pair
 
-                except (ValueError, FileNotFoundError) as e:
+                except Exception as e:
                     print(f"[Worker {worker_id}] CRITICAL: Skipping scan {path_to_load} due to error: {e}")
                     continue
     return (PrismOrderingDataset,)
@@ -687,12 +724,12 @@ def _(PrismOrderingDataset):
         os.makedirs(scratch_dir, exist_ok=True)
 
         dataset = PrismOrderingDataset(
-            metadata=METADATA_PATH,
-            patch_shape=cfg.patch_size,
-            n_patches=N_PATCHES,
-            position_space=cfg.position_space,
+            metadata='300_labeled.csv',
+            patch_shape=16,
+            n_patches=64,
+            position_space="patient",
             scratch_dir=scratch_dir,
-            n_sampled_from_same_study=cfg.num_repeated_study_samples
+            n_sampled_from_same_study=32
         )
 
         dataloader = DataLoader(

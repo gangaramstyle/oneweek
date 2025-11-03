@@ -28,80 +28,146 @@ with app.setup:
     from data_loader import nifti_scan
 
 
-@app.class_definition
-class ValidationDataset(IterableDataset):
-    def __init__(self, metadata, patch_shape=None, n_patches=None, sampling_radius_mm=10, n_samples=1, n_randoms=1):
-        super().__init__()
-        self.metadata = metadata.sample(frac=1).reset_index(drop=True) # Ensure simple integer index
-        self.patch_shape = patch_shape
-        self.n_patches = n_patches
-        self.n_samples = n_samples
-        self.n_randoms = n_randoms
-        self.sampling_radius_mm = sampling_radius_mm
+@app.cell
+def _():
+    class ValidationDataset(IterableDataset):
+        def __init__(self, metadata, patch_shape=None, n_patches=None, sampling_radius_mm=10, n_samples=10, n_randoms=20):
+            super().__init__()
+            self.metadata = metadata.sample(frac=1).reset_index(drop=True) # Ensure simple integer index
+            self.patch_shape = patch_shape
+            self.n_patches = n_patches
+            self.n_samples = n_samples
+            self.n_randoms = n_randoms
+            self.sampling_radius_mm = sampling_radius_mm
 
-        # Define labels
-        self.sample_labels = [1, 2, 3, 4, 5, 6, 7, 10]
-        self.random_labels = [0]
-        self.all_labels = self.sample_labels + self.random_labels
+            # Define labels
+            self.sample_labels = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]
+            self.random_labels = [0]
+            self.all_labels = self.sample_labels + self.random_labels
 
-    def generate_training_sample(self, scan, n_patches, sampling_radius_mm, subset_center=None):
-        # Assuming this function is defined as before
-        sample = scan.train_sample(n_patches, subset_center=subset_center, sampling_radius_mm=sampling_radius_mm)
-        patches = torch.from_numpy(sample["normalized_patches"]).to(torch.float32)
-        patch_coords = torch.from_numpy(sample['relative_patch_centers_pt']).to(torch.float32)
-        return patches, sample["patch_centers_vox"], patch_coords, sample["subset_center"]
+        def generate_training_sample(self, scan, n_patches, sampling_radius_mm, subset_center=None):
+            # Assuming this function is defined as before
+            sample = scan.train_sample(n_patches, subset_center=subset_center, sampling_radius_mm=sampling_radius_mm)
+            patches = torch.from_numpy(sample["normalized_patches"]).to(torch.float32)
+            patch_coords = torch.from_numpy(sample['relative_patch_centers_pt']).to(torch.float32)
+            return patches, sample["patch_centers_vox"], patch_coords, sample["subset_center"]
 
-    def __iter__(self):
-        # --- OPTIMIZATION: Handle multi-worker data splitting ---
-        worker_info = get_worker_info()
-        if worker_info is None:  # Single-process loading
-            start, end = 0, len(self.metadata)
-        else: # Multi-process loading
-            per_worker = int(np.ceil(len(self.metadata) / float(worker_info.num_workers)))
-            worker_id = worker_info.id
-            start = worker_id * per_worker
-            end = min(start + per_worker, len(self.metadata))
+        def __iter__(self):
+            # --- OPTIMIZATION: Handle multi-worker data splitting ---
+            worker_info = get_worker_info()
+            if worker_info is None:  # Single-process loading
+                start, end = 0, len(self.metadata)
+            else: # Multi-process loading
+                per_worker = int(np.ceil(len(self.metadata) / float(worker_info.num_workers)))
+                worker_id = worker_info.id
+                start = worker_id * per_worker
+                end = min(start + per_worker, len(self.metadata))
 
-        # Iterate over this worker's assigned slice of the metadata
-        for idx in range(start, end):
-            row = self.metadata.iloc[idx]
-            try:
-                img_path = row["raw_path"].replace("../../", "../")
-                seg_path = img_path.replace('imagesTr', 'cow_seg_labelsTr').replace('_0000', '')
+            # Iterate over this worker's assigned slice of the metadata
+            for idx in range(start, end):
+                row = self.metadata.iloc[idx]
+                try:
+                    img_path = row["raw_path"].replace("../../", "../")
+                    seg_path = img_path.replace('imagesTr', 'cow_seg_labelsTr').replace('_0000', '')
 
-                scan = nifti_scan(path_to_scan=img_path, median=row["median"], stdev=row["stdev"], base_patch_size=self.patch_shape)
-                seg = nib.as_closest_canonical(nib.load(seg_path)).get_fdata()
+                    scan = nifti_scan(path_to_scan=img_path, median=row["median"], stdev=row["stdev"], base_patch_size=self.patch_shape)
+                    seg = nib.as_closest_canonical(nib.load(seg_path)).get_fdata()
 
-            except Exception as e:
-                # Optional: print(f"Skipping {img_path} due to {e}")
-                continue
-
-            # --- OPTIMIZATION: Pre-calculate all label coordinates once per scan ---
-            locations_by_label = {
-                label: np.argwhere(seg == float(label)) for label in self.all_labels
-            }
-
-            # --- Sample from positive labels ---
-            for label in self.sample_labels:
-                possible_centers = locations_by_label.get(label, [])
-                if len(possible_centers) == 0:
+                except Exception as e:
+                    # Optional: print(f"Skipping {img_path} due to {e}")
                     continue
 
-                for _ in range(self.n_samples):
-                    subset_center = random.choice(possible_centers)
-                    patches, patch_coords_vox, patch_coords, center = self.generate_training_sample(scan, self.n_patches, self.sampling_radius_mm, subset_center=subset_center)
-                    yield patches, patch_coords_vox, patch_coords, label, img_path, center
+                # --- OPTIMIZATION: Pre-calculate all label coordinates once per scan ---
+                locations_by_label = {
+                    label: np.argwhere(seg == float(label)) for label in self.all_labels
+                }
 
-            # --- Sample from random/background labels ---
-            for label in self.random_labels:
-                possible_centers = locations_by_label.get(label, [])
-                if len(possible_centers) == 0:
+                # --- Sample from positive labels ---
+                for label in self.sample_labels:
+                    possible_centers = locations_by_label.get(label, [])
+                    if len(possible_centers) == 0:
+                        continue
+
+                    for _ in range(self.n_samples):
+                        subset_center = random.choice(possible_centers)
+                        # Add randomness of up to 3 voxels in each axis
+                        subset_center = subset_center + np.random.randint(-7, 8, size=3)
+                        patches, patch_coords_vox, patch_coords, center = self.generate_training_sample(scan, self.n_patches, self.sampling_radius_mm, subset_center=subset_center)
+                        yield patches, patch_coords_vox, patch_coords, label, img_path, center
+
+                # --- Sample from random/background labels ---
+                for label in self.random_labels:
+                    possible_centers = locations_by_label.get(label, [])
+                    if len(possible_centers) == 0:
+                        continue
+
+                    for _ in range(self.n_randoms):
+                        subset_center = random.choice(possible_centers)
+                        # Add randomness of up to 3 voxels in each axis
+                        subset_center = subset_center + np.random.randint(-3, 4, size=3)
+                        patches, patch_coords_vox, patch_coords, center = self.generate_training_sample(scan, self.n_patches, self.sampling_radius_mm, subset_center=subset_center)
+                        yield patches, patch_coords_vox, patch_coords, label, img_path, center
+
+
+    df = pd.read_parquet("/cbica/home/gangarav/rsna25/aneurysm_labels_with_nifti_coords.parquet")
+
+    df["nifti_name"] = (
+        df["zarr_path"]
+        .str.replace(
+            "/cbica/home/gangarav/data_25_processed/",
+            "/cbica/home/gangarav/rsna_any/nifti/",
+        )
+        .str.replace(".zarr", ".nii")
+    )
+
+    class AneurysmDataset(IterableDataset):
+        def __init__(self, metadata, patch_shape=None, n_patches=None, sampling_radius_mm=10, n_samples=1, n_randoms=1):
+            super().__init__()
+            self.metadata = metadata.sample(frac=1).reset_index(drop=True) # Ensure simple integer index
+            self.patch_shape = patch_shape
+            self.n_patches = n_patches
+            self.n_samples = n_samples
+            self.n_randoms = n_randoms
+            self.sampling_radius_mm = sampling_radius_mm
+
+        def generate_training_sample(self, scan, n_patches, subset_center=None):
+            # Assuming this function is defined as before
+            sample = scan.train_sample(n_patches, subset_center=subset_center, sampling_radius_mm=self.sampling_radius_mm)
+            patches = torch.from_numpy(sample["normalized_patches"]).to(torch.float32)
+            patch_coords = torch.from_numpy(sample['relative_patch_centers_pt']).to(torch.float32)
+            return patches, sample["patch_centers_vox"], patch_coords, sample["subset_center"]
+
+        def __iter__(self):
+            # --- OPTIMIZATION: Handle multi-worker data splitting ---
+            worker_info = get_worker_info()
+            if worker_info is None:  # Single-process loading
+                start, end = 0, len(self.metadata)
+            else: # Multi-process loading
+                per_worker = int(np.ceil(len(self.metadata) / float(worker_info.num_workers)))
+                worker_id = worker_info.id
+                start = worker_id * per_worker
+                end = min(start + per_worker, len(self.metadata))
+
+            # Iterate over this worker's assigned slice of the metadata
+            for idx in range(start, end):
+                row = self.metadata.iloc[idx]
+                try:
+                    img_path = row["nifti_name"]
+                    scan = nifti_scan(path_to_scan=img_path, median=row["median"], stdev=row["stdev"], base_patch_size=self.patch_shape)
+
+                except Exception as e:
+                    # Optional: print(f"Skipping {img_path} due to {e}")
                     continue
 
                 for _ in range(self.n_randoms):
-                    subset_center = random.choice(possible_centers)
-                    patches, patch_coords_vox, patch_coords, center = self.generate_training_sample(scan, self.n_patches, self.sampling_radius_mm, subset_center=subset_center)
-                    yield patches, patch_coords_vox, patch_coords, label, img_path, center
+                    try:
+                        subset_center = scan.get_random_center_idx(self.sampling_radius_mm, scan.patch_shape)
+                        for _ in range(self.n_samples):
+                            patches, patch_coords_vox, patch_coords, center = self.generate_training_sample(scan, self.n_patches, subset_center=subset_center)
+                            yield patches, patch_coords_vox, patch_coords, 13, img_path, center
+                    except:
+                        continue
+    return AneurysmDataset, ValidationDataset, df
 
 
 @app.cell(hide_code=True)
@@ -122,7 +188,7 @@ def _():
         label="Enter `wandb` Run ID (3iv8x5fq):"
     )
     mo.vstack([sampling_radius_mm_input, rotation_input, run_id_input])
-    return rotation_input, run_id_input, sampling_radius_mm_input
+    return rotation_input, sampling_radius_mm_input
 
 
 @app.function
@@ -156,14 +222,23 @@ def get_model(run_id):
 
 
 @app.cell
-def _(run_id_input):
-    model, message = get_model(run_id_input.value)
+def _():
+    model, message = get_model("5a1w4wsy") #run_id_input.value)
     message
     return (model,)
 
 
 @app.cell
-def _(base_patch_shape, model, n_patches_input, sampling_radius_mm, topcow_df):
+def _(
+    AneurysmDataset,
+    ValidationDataset,
+    base_patch_shape,
+    df,
+    model,
+    n_patches_input,
+    sampling_radius_mm,
+    topcow_df,
+):
     def _():
         all_embeddings = []
         all_locations = []
@@ -175,19 +250,45 @@ def _(base_patch_shape, model, n_patches_input, sampling_radius_mm, topcow_df):
             patch_shape=int(base_patch_shape.value),
             sampling_radius_mm=sampling_radius_mm,
             n_patches=int(n_patches_input.value),
-            n_samples=1,
+            n_samples=20,
+            n_randoms=40
+        )
+
+        loader = DataLoader(
+            validation_dataset,
+            batch_size=64,
+            num_workers=16,
+            pin_memory=True
+        )
+
+        for patches, patch_coords_vox, patch_coords_pt, label, name, subset_center in loader:
+            with torch.no_grad():
+                print("cow")
+                embeddings = model.encoder(patches.to(model.device), patch_coords_pt.to(model.device))
+                all_embeddings.append(embeddings[:, 1])
+                all_locations.extend(label)
+                all_scans.extend(name)
+                centers.extend(subset_center)
+
+        validation_dataset = AneurysmDataset(
+            metadata=df,
+            patch_shape=int(base_patch_shape.value),
+            sampling_radius_mm=sampling_radius_mm,
+            n_patches=int(n_patches_input.value),
+            n_samples=10,
             n_randoms=1
         )
 
         loader = DataLoader(
             validation_dataset,
             batch_size=64,
-            num_workers=4,
+            num_workers=16,
             pin_memory=True
         )
 
         for patches, patch_coords_vox, patch_coords_pt, label, name, subset_center in loader:
             with torch.no_grad():
+                print("rsna")
                 embeddings = model.encoder(patches.to(model.device), patch_coords_pt.to(model.device))
                 all_embeddings.append(embeddings[:, 1])
                 all_locations.extend(label)
@@ -195,6 +296,7 @@ def _(base_patch_shape, model, n_patches_input, sampling_radius_mm, topcow_df):
                 centers.extend(subset_center)
 
         all_embeddings = torch.cat(all_embeddings, dim=0)
+
         return all_embeddings, all_locations, all_scans, centers
 
     if model:
@@ -212,7 +314,7 @@ def _(all_embeddings):
     embeddings_np = all_embeddings.detach().cpu().numpy()
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(embeddings_np)
-    return SVC, X_scaled, train_test_split
+    return SVC, X_scaled, scaler, train_test_split
 
 
 @app.cell
@@ -286,12 +388,27 @@ def _(SVC, X_scaled, all_locations, all_scans, center, train_test_split):
     ax.set_xlabel('Test Size')
     ax.set_ylabel('Accuracy')
     ax.set_title('Accuracy vs Test Size')
+    plt.savefig('curve.png')
     plt.gca()
+    return (svm,)
+
+
+@app.cell
+def _(scaler, svm):
+    import pickle
+
+    # Save the scaler and SVM model to disk
+    with open('scaler.pkl', 'wb') as f:
+        pickle.dump(scaler, f)
+
+    with open('svm_model.pkl', 'wb') as f:
+        pickle.dump(svm, f)
     return
 
 
 @app.cell
 def _(
+    ValidationDataset,
     base_patch_shape,
     n_patches_input,
     rotation_input,
@@ -337,7 +454,7 @@ def _(next_button, validation_dataset):
         # Get the iterator and fetch the next sample
         iterator = iter(validation_dataset)
         patches, patch_coords_vox, patch_coords_pt, label, name, subset_center = next(iterator)
-    return label, name, patch_coords_vox, patches, subset_center
+    return name, patch_coords_vox, patches, subset_center
 
 
 @app.function
@@ -350,12 +467,6 @@ def normalize_pixels_to_range(pixel_array, w_min, w_max, out_range=(-1.0, 1.0)):
     scaled_01 = (clipped_array - w_min) / (w_max - w_min)
     out_min, out_max = out_range
     return scaled_01 * (out_max - out_min) + out_min
-
-
-@app.cell
-def _(label):
-    label
-    return
 
 
 @app.cell
