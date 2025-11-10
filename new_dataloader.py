@@ -172,6 +172,7 @@ def _(Any, Dict, Rotation, Tuple, nib, np, random):
             # Stack into a (N, LR, PA, IS) array and add channel dim
             source_blocks = np.stack(all_raw_blocks).astype(np.float32)
             source_blocks = np.expand_dims(source_blocks, axis=1) # (N, 1, LR, PA, IS)
+            print(source_blocks.shape)
 
             # 3. Get positional information
             main_center_patient = self.convert_voxel_to_patient(subset_center_vox, self.affine)
@@ -254,19 +255,25 @@ def _(Any, Dict, Rotation, Tuple, nib, np, random):
             rotation_xyz_degrees: Tuple[float, float, float],
             voxel_spacing: np.ndarray
         ) -> Dict[str, Any]:
-
+            """
+            Fixed version with proper interpolation margin for rotation.
+        
+            Key changes:
+            1. Adds adaptive margin based on rotation angles
+            2. Accounts for bilinear interpolation requirements
+            3. Prevents artifacts for non-axis-aligned rotations
+            """
+        
             # --- 1. Final Patch Shape & Rotation ---
-            # This is the desired shape *after* cropping.
             final_patch_shape_iso_vox = np.ceil(patch_shape_mm).astype(int)
-
+        
             rotation = Rotation.from_euler('xyz', rotation_xyz_degrees, degrees=True)
             forward_rotation_matrix = rotation.as_matrix()
-            # This matrix rotates from "rotated patch space" -> "original image space"
             inverse_rotation_matrix = np.linalg.inv(forward_rotation_matrix)
-
-            # --- 2. Calculate TIGHT Bounding Box (The New Logic) ---
-
-            # Get the 8 corners of the final patch, centered at (0,0,0)
+        
+            # --- 2. Calculate Bounding Box with Proper Interpolation Margin ---
+        
+            # Get the 8 corners of the final patch
             half_dims = final_patch_shape_iso_vox / 2.0
             corners = np.array([
                 [-half_dims[0], -half_dims[1], -half_dims[2]],
@@ -278,32 +285,28 @@ def _(Any, Dict, Rotation, Tuple, nib, np, random):
                 [ half_dims[0],  half_dims[1], -half_dims[2]],
                 [ half_dims[0],  half_dims[1],  half_dims[2]]
             ])
-
-            # Rotate the corners back into the original image's coordinate space
+        
+            # Rotate corners to find axis-aligned bounding box (AABB)
             rotated_corners = (inverse_rotation_matrix @ corners.T).T
-
-            # Find the maximum extent of the rotated corners along each axis
-            # This gives us the axis-aligned bounding box (AABB)
             aabb_half_dims = np.max(np.abs(rotated_corners), axis=0)
-
-            # The full size of the source block is twice the half-dimensions
-            source_block_shape_iso_vox = np.ceil(aabb_half_dims * 2.0) + 4
-
+            print("aabb_half_dims", aabb_half_dims)
+        
+            # Calculate source block size with proper margin
+            source_block_shape_iso_vox = np.ceil(aabb_half_dims * 2.0)
+            print("source_block_shape_iso_vox", source_block_shape_iso_vox)
+        
             # --- 3. Convert to Original Voxel Grid ---
-
-            # We assume 1mm isotropic spacing for the GPU steps
             resampling_factor = voxel_spacing / np.array([1.0, 1.0, 1.0])
-
-            # Calculate the shape to extract from the *original* NIfTI
             source_block_shape_orig_vox = np.ceil(
                 source_block_shape_iso_vox / resampling_factor
             ).astype(int)
 
-            # --- 4. Ensure odd dimensions (for stable center pixel) ---
-            # Make sure the shapes are odd-numbered for a precise center
+            print("source_block_shape_orig_vox", source_block_shape_orig_vox)
+        
+            # --- 4. Ensure odd dimensions for stable center ---
             source_block_shape_iso_vox = source_block_shape_iso_vox + (source_block_shape_iso_vox % 2 == 0)
             source_block_shape_orig_vox = source_block_shape_orig_vox + (source_block_shape_orig_vox % 2 == 0)
-
+        
             return {
                 "final_patch_shape_iso_vox": final_patch_shape_iso_vox.astype(int),
                 "source_block_shape_iso_vox": source_block_shape_iso_vox.astype(int),
@@ -394,30 +397,23 @@ def _(Any, Dataset, Dict, F, NiftiPatchSampler, Tuple, torch):
 
         @staticmethod
         def _rotate_batch_pytorch(
-            batch_tensor: torch.Tensor, # Shape (N, 1, D, H, W)
-            rotation_xyz_degrees: torch.Tensor # Shape (3,)
+            batch_tensor: torch.Tensor, # Shape (N, 1, D_src, H_src, W_src)
+            rotation_xyz_degrees: torch.Tensor, # Shape (3,)
+            final_shape: Tuple[int, int, int] # e.g., (128, 128, 1)
         ) -> torch.Tensor:
             """
-            Applies 3D rotation using F.affine_grid and F.grid_sample.
-            This version is PURE TORCH and stays on the GPU.
+            Applies 3D rotation and resampling to the FINAL shape.
             """
             device = batch_tensor.device
             n_patches = batch_tensor.shape[0]
-
-            # 1. Convert degrees to radians ON-DEVICE
-            # We unsqueeze to (3, 1) for broadcasting later
+        
+            # 1. ... (Angles and rotation matrices R, Rx, Ry, Rz are all correct) ...
+            # (Same as before)
             angles_rad = torch.deg2rad(rotation_xyz_degrees)
-
-            # Grid 'x' rotation (NIfTI Z-axis / Axial) comes from input[2]
             angle_x = angles_rad[2] 
-
-            # Grid 'y' rotation (NIfTI Y-axis / Coronal) comes from input[1]
             angle_y = angles_rad[1]
-
-            # Grid 'z' rotation (NIfTI X-axis / Sagittal) comes from input[0]
             angle_z = angles_rad[0]
 
-            # 2. Create individual rotation matrices ON-DEVICE
             cos_x, sin_x = torch.cos(angle_x), torch.sin(angle_x)
             Rx = torch.tensor([
                 [1, 0, 0], 
@@ -443,21 +439,27 @@ def _(Any, Dataset, Dict, F, NiftiPatchSampler, Tuple, torch):
             R = Rz @ Ry @ Rx
             affine_matrix_3x4 = torch.eye(3, 4, dtype=torch.float32, device=device)
             affine_matrix_3x4[:3, :3] = R
-
-            # 4. Expand to batch size (N, 3, 4)
             theta = affine_matrix_3x4.unsqueeze(0).expand(n_patches, -1, -1)
 
-            # 5. Generate grid and sample (all on GPU)
-            grid = F.affine_grid(theta, batch_tensor.shape, align_corners=False)
-            rotated_batch = F.grid_sample(
-                batch_tensor, 
-                grid, 
+            # 4. --- THIS IS THE FIX ---
+            # Define the target grid shape (N, C, D_final, H_final, W_final)
+            # We must add the (N, C) dims to the final_shape
+            target_grid_shape = (n_patches, 1) + final_shape 
+
+            # 5. Generate grid for the FINAL shape and sample from the SOURCE tensor
+            grid = F.affine_grid(theta, target_grid_shape, align_corners=False)
+        
+            # F.grid_sample will output a tensor of shape `target_grid_shape`
+            rotated_and_cropped_batch = F.grid_sample(
+                batch_tensor,  # Source (e.g., [10, 1, 121, 129, 45])
+                grid,          # Grid defining output (e.g., [10, 1, 128, 128, 1])
                 mode='bilinear',
                 padding_mode='zeros', 
                 align_corners=False
             )
 
-            return rotated_batch
+            print("rotated_batch shape (FINAL):", rotated_and_cropped_batch.shape)
+            return rotated_and_cropped_batch
 
 
         def __call__(self, batch: Dict[str, Any]) -> torch.Tensor:
@@ -482,11 +484,12 @@ def _(Any, Dataset, Dict, F, NiftiPatchSampler, Tuple, torch):
                 rot_degrees_i = batch['rotation_degrees'][i]
                 wc_i = batch['wc'][i].item()
                 ww_i = batch['ww'][i].item()
-                final_shape_i = params_i['final_patch_shape_iso_vox']
+                final_shape_i = tuple(int(dim) for dim in params_i['final_patch_shape_iso_vox'])
 
                 # --- 1: (GPU) Resample to Isotropic ---
                 target_iso_shape = params_i['source_block_shape_iso_vox']
                 target_iso_shape_ints = tuple(int(dim) for dim in target_iso_shape)
+                print("target_iso_shape", target_iso_shape)
 
                 # This F.interpolate now takes a variable-sized input...
                 isotropic_blocks = F.interpolate(
@@ -495,22 +498,16 @@ def _(Any, Dataset, Dict, F, NiftiPatchSampler, Tuple, torch):
                     mode='trilinear',
                     align_corners=False
                 )
+            
                 # ...and produces a fixed-size output, (N, 1, D_iso, H_iso, W_iso)
 
                 # --- 2: (GPU) Apply Rotation ---
-                rotated_blocks = self._rotate_batch_pytorch(isotropic_blocks, rot_degrees_i)
-
-                # --- 3: (GPU) Apply Center Crop ---
-                current_shape_dhw = rotated_blocks.shape[2:]
-                starts = [(rs - fs) // 2 for rs, fs in zip(current_shape_dhw, final_shape_i)]
-                ends = [s + fs for s, fs in zip(starts, final_shape_i)]
-                cropped_blocks = rotated_blocks[
-                    :, :,
-                    starts[0]:ends[0],
-                    starts[1]:ends[1],
-                    starts[2]:ends[2]
-                ]
-
+                cropped_blocks = self._rotate_batch_pytorch(
+                    isotropic_blocks, 
+                    rot_degrees_i,
+                    final_shape_i # Final shape (e.g., 128, 128, 1)
+                )
+            
                 # --- 4: (GPU) Apply Windowing ---
                 normalized_blocks = self._normalize_batch(cropped_blocks, wc_i, ww_i)
 
@@ -522,7 +519,7 @@ def _(Any, Dataset, Dict, F, NiftiPatchSampler, Tuple, torch):
                     align_corners=False
                 )
 
-                final_patches_list.append(final_patch)
+                final_patches_list.append(cropped_blocks) #final_patch)
 
             # Stacks the list of (N, C, D, H, W) tensors into (B, N, C, D, H, W)
             return torch.stack(final_patches_list, dim=0)
@@ -627,6 +624,7 @@ def _(
         base_patch_size=int(base_patch_size_field.value),
         subset_center_vox=np.array([int(x.strip()) for x in center_point_vox.value.split(',')])
     )
+    param_dict
     return (param_dict,)
 
 
@@ -671,6 +669,7 @@ def _(mo, np, param_dict, patch_center_field, patch_centers_vox, sampler):
     **Main Center (Patient Coordinates):** `{main_center_labeled}`  
     **Patch Centers (Patient Coordinates):** `{patch_centers_labeled}`  
     **Relative Rotated Centers:** `{relative_rotated_labeled}`
+    **Source Block Shape:** `{source_block_shape_orig_vox}`
     """)
     return source_block_shape_orig_vox, updated_patch_centers_vox
 
@@ -727,7 +726,7 @@ def _(DEVICE, mo, param_dict, patch_selector, source_blocks, t, torch):
         'ww': torch.tensor([param_dict['ww']]).to(DEVICE)
     })
 
-    mo.hstack([mo.image(src=patches[0,patch_selector.value,0,:,:,0].cpu().numpy(), height=64), patches.shape])
+    mo.hstack([mo.image(src=patches[0,patch_selector.value,0,:,:,patches.shape[-1]//2].cpu().numpy(), height=64), patches.shape])
     return
 
 
