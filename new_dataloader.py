@@ -57,13 +57,15 @@ def _(Any, Dict, Rotation, nib, np, random):
 
         def _get_outlier_axis(self, similarity_threshold: float = 1.1) -> int:
             shape = np.array(self.nii_data.shape)
+            print(max(shape), min(shape))
             if max(shape) / min(shape) < similarity_threshold:
-                return random.randint(0, 2)
+                return 2 #random.randint(0, 2)
             diffs = [
                 abs(shape[0] - (shape[1] + shape[2]) / 2.0),
                 abs(shape[1] - (shape[0] + shape[2]) / 2.0),
                 abs(shape[2] - (shape[0] + shape[1]) / 2.0)
             ]
+            print(diffs)
             return np.argmax(diffs)
 
         def get_sample_parameters(self, 
@@ -212,7 +214,9 @@ def _(Any, Dict, Rotation, nib, np, random):
 
             rotated_corners = (inverse_rotation_matrix @ corners.T).T
             aabb_half_dims = np.max(np.abs(rotated_corners), axis=0)
+            print("aabb_dims", aabb_half_dims * 2.0)
             source_block_shape_iso = np.ceil(aabb_half_dims * 2.0)
+            print("source_block_shape_iso", source_block_shape_iso)
 
             # Convert to Original Grid
             resampling_factor = voxel_spacing / np.array([1.0, 1.0, 1.0])
@@ -317,14 +321,27 @@ def _(Any, Dataset, Dict, F, Tuple, torch):
             theta = torch.zeros((n_patches, 3, 4), device=device, dtype=torch.float32)
             theta[:, :3, :3] = R
 
-            target_grid_shape = (n_patches, 1) + final_shape 
+            scaling_factor = final_shape[-1]/torch.flip(torch.tensor(list(batch_tensor.shape[2:])), dims=[0])
+            print("scaling_factor", scaling_factor, f'{final_shape[-1]}/{torch.flip(torch.tensor(list(batch_tensor.shape[2:])), dims=[0])}')
+            # Ensure scaling_factor is on the same device as grid to avoid errors
+            scaling_factor = scaling_factor.to(device)
+
+            target_grid_shape = (n_patches, 1) + final_shape
             grid = F.affine_grid(theta, target_grid_shape, align_corners=False)
+
             grid_max_per_axis = grid.amax(dim=(0,1,2,3))
+            print(grid.shape)
+            print(scaling_factor.shape, scaling_factor)
             print("grid_max_per_axis", grid_max_per_axis)
+
+            # Direct multiplication (broadcasts [3] across [10, 1, 128, 128])
+            scaled_grid = grid * scaling_factor
+            scaled_grid_max_per_axis = scaled_grid.amax(dim=(0,1,2,3))
+            print("scaled_grid_max_per_axis", scaled_grid_max_per_axis)
 
             # Grid Sample
             rotated_batch = F.grid_sample(
-                batch_tensor, grid, mode='bilinear', padding_mode='zeros', align_corners=False
+                batch_tensor, scaled_grid, mode='bilinear', padding_mode='zeros', align_corners=False
             )
             return rotated_batch
 
@@ -421,7 +438,7 @@ def _(Any, Dict, List, default_collate, torch):
 @app.cell(column=1)
 def _(NiftiPatchSampler, mo):
     sampler = NiftiPatchSampler(
-        path_to_scan="/cbica/home/gangarav/rsna23/nifti/10046.nii.gz"
+        path_to_scan="/cbica/home/gangarav/rsna23/nifti/10000.nii.gz"
     )
 
     mo.vstack([
@@ -492,7 +509,6 @@ def _(
         base_patch_size=int(base_patch_size_field.value),
         subset_center_vox=np.array([int(x.strip()) for x in center_point_vox.value.split(',')])
     )
-    param_dict
     return (param_dict,)
 
 
@@ -598,12 +614,6 @@ def _(DEVICE, mo, param_dict, patch_selector, source_blocks, t, torch):
     })
 
     mo.hstack([mo.image(src=patches[0,patch_selector.value,0,:,:,patches.shape[-1]//2].cpu().numpy(), height=64), patches.shape])
-    return (patches,)
-
-
-@app.cell
-def _(patches):
-    patches.shape
     return
 
 
