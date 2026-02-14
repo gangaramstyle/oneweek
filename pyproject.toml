@@ -1,0 +1,45 @@
+[build-system]
+requires = ["hatchling>=1.24.0"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oneweek"
+version = "0.1.0"
+description = "Rotation-aware prism/patch sampling for volumetric medical imaging"
+requires-python = ">=3.10"
+dependencies = [
+  "numpy>=1.26",
+  "scipy>=1.11",
+  "nibabel>=5.2",
+  "marimo>=0.16.5",
+  "einops>=0.7",
+  "zarr>=2.17",
+  "pandas>=2.2",
+  "fastparquet>=2024.2.0",
+  "matplotlib>=3.8",
+  "pydicom>=2.4",
+  "scikit-image>=0.23",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest>=8.0",
+]
+
+[tool.hatch.build.targets.wheel]
+include = [
+  "data_loader.py",
+  "rotation_loader_core.py",
+  "rotation_loader_sanity.py",
+  "mim_lightning_train.py",
+  "rvt_model.py",
+  "validation_exploration.py",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "README.md",
+  "pyproject.toml",
+  "*.py",
+  "tests/*.py",
+]

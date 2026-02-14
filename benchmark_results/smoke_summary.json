@@ -1,0 +1,60 @@
+{
+  "config": {
+    "seed": 12345,
+    "n_cases": 4,
+    "runs_per_case": 2,
+    "n_patches": 24,
+    "base_patch_size_mm": 16,
+    "methods": [
+      "optimized_fused",
+      "optimized_local"
+    ],
+    "modality": "CT",
+    "window_center": 0.0,
+    "window_width": 250.0,
+    "radius_candidates_mm": [
+      22.0,
+      18.0,
+      14.0,
+      10.0,
+      8.0
+    ],
+    "rotation_bounds_deg": {
+      "x": 20.0,
+      "y": 20.0,
+      "z": 20.0
+    }
+  },
+  "total_rows": 16,
+  "skipped_runs": 0,
+  "methods": {
+    "optimized_fused": {
+      "method": "optimized_fused",
+      "n": 8,
+      "patch_norm_mae_mean": 0.044526126235723495,
+      "patch_norm_mae_p95": 0.062380855716764924,
+      "patch_norm_abs_p95_mean": 0.15628277324140072,
+      "patch_norm_abs_p95_p95": 0.24756233915686604,
+      "position_unrot_max_mm": 0.0,
+      "position_rot_max_mm": 0.0,
+      "time_method_median_s": 0.0006532705156132579,
+      "time_naive_median_s": 0.014401229040231556,
+      "speed_ratio_method_over_naive_median": 0.05449056938723407,
+      "speedup_naive_over_method_median": 18.36030366988366
+    },
+    "optimized_local": {
+      "method": "optimized_local",
+      "n": 8,
+      "patch_norm_mae_mean": 0.04241151735186577,
+      "patch_norm_mae_p95": 0.05760878529399633,
+      "patch_norm_abs_p95_mean": 0.14006854966282845,
+      "patch_norm_abs_p95_p95": 0.1880631923675537,
+      "position_unrot_max_mm": 0.0,
+      "position_rot_max_mm": 0.0,
+      "time_method_median_s": 0.006951083487365395,
+      "time_naive_median_s": 0.014401229040231556,
+      "speed_ratio_method_over_naive_median": 0.4895890840671002,
+      "speedup_naive_over_method_median": 2.044913381604952
+    }
+  }
+}
